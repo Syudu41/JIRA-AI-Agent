@@ -1,0 +1,232 @@
+---------------------------------------------------------------------------------------------------------------
+
+Additional Informaton: 
+
+
+Step-by-step build (Python, minimal UI)
+0) What you’ll need
+
+Jira Cloud site + a user with permission to read/update issues.
+
+Atlassian API token (Basic auth = email + API token). How to create & use tokens in Jira Cloud is documented here. 
+Atlassian Support
++1
+
+Jira REST API v3 endpoints for read/update issues; v3 supports the ADF document format in the description field. 
+Atlassian Developer
+
+OpenAI API (we’ll use the Responses API with structured outputs / function calling). 
+OpenAI Platform
+
+Optional Python Jira client (jira or atlassian-python-api) to simplify auth and endpoints. 
+jira.readthedocs.io
++1
+
+Environment variables (suggested):
+
+OPENAI_API_KEY=...
+JIRA_BASE_URL=https://your-domain.atlassian.net
+JIRA_EMAIL=you@company.com
+JIRA_API_TOKEN=...
+
+1) Install packages
+pip install openai python-dotenv requests
+# optional convenience clients:
+pip install jira atlassian-python-api
+
+2) Fetch summary → ask LLM → update Jira
+
+High-level flow:
+
+GET /rest/api/3/issue/{key}?fields=summary,description → read summary.
+
+Send prompt + summary to OpenAI with a JSON schema (structured output). 
+OpenAI Platform
++1
+
+Convert model’s description_markdown → Jira ADF (or keep markdown if your Jira project allows markdown renderer; for Cloud, prefer ADF). 
+Atlassian Developer
+
+PUT /rest/api/3/issue/{key} with fields.description (ADF) and optionally a custom field for Tech Stack (e.g., customfield_12345). Tip: discover your field id via /rest/api/3/field. 
+Atlassian Developer
+
+Minimal Python sketch (requests + Responses API)
+import os, base64, json, requests
+from dotenv import load_dotenv
+from openai import OpenAI
+
+load_dotenv()
+JIRA = os.getenv("JIRA_BASE_URL").rstrip("/")
+EMAIL = os.getenv("JIRA_EMAIL")
+TOKEN = os.getenv("JIRA_API_TOKEN")
+OAI  = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+def jira_auth_header():
+    # Basic auth: email + API token
+    b = f"{EMAIL}:{TOKEN}".encode()
+    return {"Authorization": "Basic " + base64.b64encode(b).decode()}
+
+def get_issue_summary(issue_key):
+    url = f"{JIRA}/rest/api/3/issue/{issue_key}"
+    r = requests.get(url, headers={
+        **jira_auth_header(),
+        "Accept": "application/json"
+    }, params={"fields":"summary"})
+    r.raise_for_status()
+    data = r.json()
+    return data["fields"]["summary"]
+
+def to_adf_from_markdown(md_text):
+    # Simplest path: wrap markdown into ADF code block paragraph.
+    # For production, convert Markdown→ADF properly; this “good enough” shim works for plain text.
+    return {
+      "type":"doc","version":1,
+      "content":[{"type":"paragraph","content":[{"type":"text","text":md_text}]}]
+    }
+
+def fill_specs(issue_key, project_context=None, tech_field_id=None):
+    summary = get_issue_summary(issue_key)
+
+    schema = {
+      "name": "JiraSpec",
+      "strict": True,
+      "schema": {
+        "type":"object",
+        "properties":{
+          "description_markdown":{"type":"string","maxLength":4000},
+          "tech_stack":{"type":"array","items":{"type":"string"}},
+          "assumptions":{"type":"array","items":{"type":"string"}}
+        },
+        "required":["description_markdown","tech_stack","assumptions"],
+        "additionalProperties": False
+      }
+    }
+
+    user_input = f"""Project context: {project_context or "N/A"}
+Issue: {issue_key}
+Summary: {summary}"""
+
+    resp = OAI.responses.create(
+        model="gpt-4.1-mini",
+        input=[
+          {"role":"system","content":"You are a Jira Specification Filler Agent."},
+          {"role":"user","content": user_input}
+        ],
+        # Ask for strict JSON back:
+        # (Responses API supports structured outputs / tool calling)
+        # https://platform.openai.com/docs/guides/function-calling/function-calling-with-structured-outputs
+        metadata={"purpose":"jira-spec-filler"},
+        response_format={"type":"json_schema","json_schema": schema},
+    )
+    data = json.loads(resp.output_text)
+
+    # Prepare Jira update
+    fields_update = {
+      "description": to_adf_from_markdown(data["description_markdown"])
+    }
+    if tech_field_id:
+        fields_update[tech_field_id] = ", ".join(data["tech_stack"])
+
+    url = f"{JIRA}/rest/api/3/issue/{issue_key}"
+    r = requests.put(url,
+        headers={
+          **jira_auth_header(),
+          "Content-Type":"application/json",
+          "Accept":"application/json"
+        },
+        json={"fields": fields_update}
+    )
+    r.raise_for_status()
+    return {"updated": issue_key, "tech_stack": data["tech_stack"]}
+
+# Example:
+# print(fill_specs("PROJ-123", project_context="Python API + Postgres", tech_field_id="customfield_12345"))
+
+
+Atlassian shows basic auth with email:APITOKEN. 
+Atlassian Developer
+
+Updating an issue is a PUT with {"fields": {...}}. 
+Atlassian Developer
++1
+
+Finding your Tech Stack field id: call GET /rest/api/3/field and look for your custom field’s id (e.g., customfield_10042). Then pass that id as tech_field_id. 
+Atlassian Developer
+
+3) Optional: use a Python Jira client
+
+You can replace the requests calls with either:
+
+jira (pip install jira) – popular, well-documented. 
+jira.readthedocs.io
+
+atlassian-python-api – supports multiple Atlassian products. 
+PyPI
+
+These libraries expose helpers like jira.issue(issue_key) and jira.issue.update(fields=...).
+
+4) Dealing with Jira’s Description format (ADF)
+
+Jira Cloud uses ADF for rich text; v3 adds ADF support for description and textarea custom fields. You can post a simple paragraph (as in the example) or convert Markdown → ADF for headings, lists, code blocks, etc. (there are OSS converters or you can craft ADF blocks yourself). 
+Atlassian Developer
+
+MCP option (nice-to-have)
+
+If you want your agent to call Jira as a tool over the Model Context Protocol (MCP):
+
+MCP is an open protocol for wiring models to tools/data via “servers” the host (your agent) connects to. 
+GitHub
++1
+
+There are reference MCP servers you can adapt; you could create a jira MCP server that exposes tools like get_issue, update_issue, list_fields. 
+GitHub
+
+MCP architecture (quick sketch):
+
+Host: your Python app (the “agent”) with an MCP client.
+
+Server: your jira-mcp-server (Node or Python) implements methods that call Jira REST.
+
+The model calls tools via MCP; your host relays calls to the server, which executes and returns results.
+
+Why consider MCP? Portability of tools between different LLM hosts; standardized auth and tool schemas. (Security hardening—handle identity & secrets carefully; see industry notes on MCP identity/secret management.) 
+The Verge
++1
+
+Security check-list
+
+Store Atlassian tokens in a secret manager; never in code. Rotate regularly. 
+Atlassian Support
+
+Use least privilege (a dedicated Jira “bot” user).
+
+Log every issue update with old/new values and the LLM output.
+
+Add a “dry-run” mode that writes to a comment first, then a human approves.
+
+Consider schema-strict outputs (already in sample) and add max length caps. 
+Microsoft Learn
+
+Testing workflow
+
+Create a sandbox issue (“TEST-1”) with a short summary.
+
+Run your script in dry-run: print the JSON and render the ADF preview.
+
+Switch on updates for a single project.
+
+Add CI step that lints JSON, checks for PII, and ensures no forbidden tech terms.
+
+Monitor: count re-edits by humans to measure quality.
+
+Troubleshooting notes
+
+401 Unauthorized → check email/token pair and that you’re using the correct Cloud base URL; tokens are per account and can be revoked. 
+Atlassian Developer
++1
+
+404 on issue update → verify API path and that the field id exists in that project’s screen. 
+Atlassian Community
+
+Description not rendering → you likely sent Markdown to a project expecting ADF; convert properly. 
+Atlassian Developer
